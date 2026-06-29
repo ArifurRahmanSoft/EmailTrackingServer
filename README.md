@@ -103,3 +103,4 @@ transparent 1x1 PNG. The Phase 2 tracking implementation is unchanged.
 - The `.gitignore` excludes generated workbooks, logs, virtual environments,
   caches, and local environment files.
 "# EmailTrackingServer" 
+"# EmailTrackingServer" 
