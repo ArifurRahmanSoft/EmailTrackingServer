@@ -27,6 +27,7 @@ class Settings:
     log_level: str
     data_folder: Path
     log_folder: Path
+    database_url: str | None
 
     @property
     def tracking_file(self) -> Path:
@@ -45,4 +46,5 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         data_folder=data_folder.resolve(),
         log_folder=PROJECT_ROOT / "logs",
+        database_url=os.getenv("DATABASE_URL"),
     )

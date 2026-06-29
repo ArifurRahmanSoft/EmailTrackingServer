@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-from app.api.routes import router, tracking_service
+from app.api.routes import database_service, router, tracking_service
 from app.utils.logging import configure_logging
 from config.settings import Settings, load_settings
 
@@ -34,8 +34,15 @@ async def lifespan(_: FastAPI):
         logger.error(
             "Tracking workbook initialization failed: %s", exc, exc_info=True
         )
+    try:
+        database_service.initialize()
+        logger.info("PostgreSQL connection ready; database tables verified")
+    except Exception as exc:
+        # Database availability never prevents Excel tracking or application startup.
+        logger.error("PostgreSQL initialization failed: %s", exc, exc_info=True)
     logger.info("EmailTrackingServer started")
     yield
+    database_service.dispose()
     logger.info("EmailTrackingServer stopped")
 
 

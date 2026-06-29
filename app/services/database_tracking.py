@@ -1,0 +1,177 @@
+"""PostgreSQL persistence for email tracking events."""
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from sqlalchemy import Engine, create_engine, func, inspect, select, text
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.models.email_tracking import Base, EmailTracking
+
+
+class DatabaseUnavailableError(RuntimeError):
+    """Raised when PostgreSQL is not configured or cannot complete an operation."""
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseStatus:
+    """Read-only database health details."""
+
+    connected: bool
+    table_exists: bool
+    total_records: int
+    error: str | None = None
+
+
+class DatabaseTrackingService:
+    """Create the schema and mirror successful Excel tracking writes."""
+
+    def __init__(self, database_url: str | None) -> None:
+        self._database_url = database_url
+        self._engine: Engine | None = None
+        self._session_factory: sessionmaker[Session] | None = None
+        self._configuration_error: str | None = None
+
+        if database_url:
+            try:
+                sqlalchemy_url = self._normalize_database_url(database_url)
+                self._engine = create_engine(
+                    sqlalchemy_url,
+                    pool_pre_ping=True,
+                    pool_recycle=300,
+                    connect_args={"connect_timeout": 10},
+                )
+                self._session_factory = sessionmaker(
+                    bind=self._engine,
+                    expire_on_commit=False,
+                )
+            except Exception as exc:
+                # A malformed database setting must not prevent Excel tracking.
+                self._configuration_error = str(exc)
+
+    @property
+    def configured(self) -> bool:
+        """Return whether DATABASE_URL was provided."""
+        return self._engine is not None
+
+    def initialize(self) -> None:
+        """Create all ORM tables and verify the database connection."""
+        engine = self._require_engine()
+        Base.metadata.create_all(engine)
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+    def record_open(
+        self,
+        tracking_id: str,
+        open_count: int,
+        client_ip: str,
+        user_agent: str,
+        occurred_at: datetime,
+    ) -> None:
+        """Insert or update one open event using an atomic PostgreSQL upsert."""
+        session_factory = self._require_session_factory()
+        timestamp = self._as_utc(occurred_at)
+
+        statement = postgresql_insert(EmailTracking).values(
+            tracking_id=tracking_id,
+            open_count=open_count,
+            click_count=0,
+            first_open=timestamp,
+            last_open=timestamp,
+            last_ip=client_ip,
+            user_agent=user_agent,
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[EmailTracking.tracking_id],
+            set_={
+                "open_count": open_count,
+                "last_open": timestamp,
+                "updated_at": func.now(),
+                "last_ip": client_ip,
+                "user_agent": user_agent,
+            },
+        )
+
+        try:
+            with session_factory() as session:
+                session.execute(statement)
+                session.commit()
+        except Exception as exc:
+            raise DatabaseUnavailableError(
+                f"Unable to update PostgreSQL tracking record: {exc}"
+            ) from exc
+
+    def get_status(self) -> DatabaseStatus:
+        """Return connection, table, and row-count diagnostics."""
+        if self._engine is None or self._session_factory is None:
+            return DatabaseStatus(
+                connected=False,
+                table_exists=False,
+                total_records=0,
+                error=(
+                    self._configuration_error or "DATABASE_URL is not configured."
+                ),
+            )
+
+        try:
+            with self._engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            table_exists = inspect(self._engine).has_table(EmailTracking.__tablename__)
+            total_records = 0
+            if table_exists:
+                with self._session_factory() as session:
+                    total_records = int(
+                        session.scalar(select(func.count()).select_from(EmailTracking))
+                        or 0
+                    )
+            return DatabaseStatus(
+                connected=True,
+                table_exists=table_exists,
+                total_records=total_records,
+            )
+        except Exception as exc:
+            return DatabaseStatus(
+                connected=False,
+                table_exists=False,
+                total_records=0,
+                error=str(exc),
+            )
+
+    def dispose(self) -> None:
+        """Release pooled database connections during application shutdown."""
+        if self._engine is not None:
+            self._engine.dispose()
+
+    def _require_engine(self) -> Engine:
+        if self._engine is None:
+            raise DatabaseUnavailableError(
+                self._configuration_error or "DATABASE_URL is not configured."
+            )
+        return self._engine
+
+    def _require_session_factory(self) -> sessionmaker[Session]:
+        if self._session_factory is None:
+            raise DatabaseUnavailableError(
+                self._configuration_error or "DATABASE_URL is not configured."
+            )
+        return self._session_factory
+
+    @staticmethod
+    def _normalize_database_url(database_url: str) -> str:
+        """Select psycopg 3 for standard Neon PostgreSQL URL schemes."""
+        if database_url.startswith("postgres://"):
+            return database_url.replace("postgres://", "postgresql+psycopg://", 1)
+        if database_url.startswith("postgresql://"):
+            return database_url.replace(
+                "postgresql://", "postgresql+psycopg://", 1
+            )
+        return database_url
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        """Return a timezone-aware timestamp for PostgreSQL."""
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)

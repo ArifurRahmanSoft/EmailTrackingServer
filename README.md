@@ -1,20 +1,37 @@
 # EmailTrackingServer
 
 EmailTrackingServer is a standalone FastAPI service for email-open tracking.
-It stores events in `data/EmailTracking.xlsx` and does not send email or
-implement a dashboard, database, authentication, reports, scheduler, desktop
-integration, or click-tracking logic.
+It dual-writes open events to `data/EmailTracking.xlsx` and Neon PostgreSQL.
+Excel support remains active and tracking continues when PostgreSQL is
+temporarily unavailable.
+
+The project does not send email or implement a dashboard, authentication,
+reports, scheduler, desktop integration, or click-tracking logic.
 
 ## Requirements
 
 - Python 3.12
-- FastAPI
-- Uvicorn
-- openpyxl
-- Pillow
+- FastAPI and Uvicorn
+- openpyxl and Pillow
+- SQLAlchemy 2 ORM
+- psycopg 3 PostgreSQL driver
+- Neon PostgreSQL
 
 All Python dependencies are pinned in `requirements.txt`. Render selects Python
 3.12 from the root `.python-version` file.
+
+## Environment variables
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | Yes on Render | Neon PostgreSQL connection string |
+| `PORT` | Yes on Render | Port exposed by the web service |
+| `LOG_LEVEL` | No | Logging level; defaults to `INFO` |
+| `DATA_FOLDER` | No | Excel folder; defaults locally to `data/` |
+
+Never commit `DATABASE_URL` or place it directly in source code. The application
+accepts Neon's standard `postgresql://` URL and selects the psycopg 3 driver
+automatically.
 
 ## Local setup
 
@@ -25,82 +42,93 @@ python -m pip install -r requirements.txt
 $env:PORT = "8000"
 $env:LOG_LEVEL = "INFO"
 $env:DATA_FOLDER = "data"
+$env:DATABASE_URL = "postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require"
 uvicorn main:app --host 0.0.0.0 --port $env:PORT
 ```
 
 Swagger UI is available at `http://localhost:8000/docs`.
 
-## Environment variables
+## Automatic database setup
 
-| Variable | Render value | Purpose |
-| --- | --- | --- |
-| `PORT` | `10000` | Port exposed by the Render web service |
-| `LOG_LEVEL` | `INFO` | Application logging level |
-| `DATA_FOLDER` | `/opt/render/project/src/data` | Persistent workbook directory |
+At application startup, SQLAlchemy calls `Base.metadata.create_all()` using
+`DATABASE_URL`. This creates the `email_tracking` table if it does not exist;
+no manual SQL or migration command is required for this phase. Existing tables
+and rows are left intact.
 
-When `DATA_FOLDER` is omitted locally, it defaults to the project-relative
-`data/` directory. The application creates both the configured data directory
-and `EmailTracking.xlsx` automatically. It also creates `logs/` automatically
-and writes daily `YYYY-MM-DD.log` files.
+The table contains:
+
+- `id` as its primary key and unique `tracking_id`
+- `recipient_email` and `sender_email`
+- `open_count` and `click_count`
+- `first_open`, `last_open`, `first_click`, and `last_click`
+- `created_at` and `updated_at`
+- `last_ip` and `user_agent`
+
+For each successful Excel open update, PostgreSQL receives an atomic upsert with
+the resulting Excel `OpenCount`. An existing database row retains `first_open`
+while `open_count`, `last_open`, `last_ip`, `user_agent`, and `updated_at` are
+updated. A database error is logged and never changes the tracking-pixel HTTP
+response or rolls back the Excel write.
+
+## Excel storage
+
+The application creates the configured data folder and `EmailTracking.xlsx`
+automatically. Daily logs are written to `logs/YYYY-MM-DD.log`. The existing
+Excel schema and tracking behavior remain unchanged.
+
+## Development endpoints
+
+Temporary debug routes appear in Swagger under **Development / Debug Only**:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/tracking` | List Excel tracking records |
+| `GET /api/download-excel` | Download the current workbook |
+| `GET /api/debug` | Show application and Excel diagnostics |
+| `GET /api/database/status` | Show database connection, table, and row count |
+
+Example database status response:
+
+```json
+{
+  "database_connected": true,
+  "table_exists": true,
+  "total_records": 12
+}
+```
 
 ## Deploy to Render
 
-The repository includes a Render Blueprint in `render.yaml`.
-
-1. Push this project to a GitHub, GitLab, or Bitbucket repository.
-2. In the Render Dashboard, select **New > Blueprint**.
-3. Connect the repository containing this project.
-4. Confirm that Render detects the root `render.yaml` file.
-5. Review the `email-tracking-server` service and apply the Blueprint.
-6. Wait for the build and `/health` health check to pass.
-
-Render uses these commands:
+The repository includes `render.yaml` with these commands:
 
 ```text
 Build Command: pip install -r requirements.txt
 Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
-The Blueprint provisions a Starter web service and a 1 GB persistent disk at
-`/opt/render/project/src/data`. The disk is necessary because Render's default
-filesystem is ephemeral; without it, Excel updates would be lost on restarts
-and deployments. Persistent disks are not available on Render's free web-service
-plan.
+1. Push the project to a Git repository connected to Render.
+2. In Render, create or sync the Blueprint from `render.yaml`.
+3. In the service Environment page, set the existing Neon `DATABASE_URL` as a
+   secret environment variable.
+4. Deploy and wait for the `/health` check to pass.
+5. Open `/api/database/status` and confirm all three values indicate success.
 
-`runtime.txt` is intentionally not included because Render currently uses
-`.python-version` for Python selection. A `Procfile` is unnecessary because the
-Blueprint defines `startCommand` directly.
+Render preserves the separately configured `DATABASE_URL` because the Blueprint
+does not define or overwrite it.
 
-## Verify the deployment
-
-Replace `<service-name>` with the deployed Render hostname:
+## Verification URLs
 
 ```text
 https://<service-name>.onrender.com/health
 https://<service-name>.onrender.com/email/open/test123
+https://<service-name>.onrender.com/api/database/status
 https://<service-name>.onrender.com/docs
 ```
 
-The health endpoint must return:
+The `/health` response remains:
 
 ```json
 {
   "status": "ok"
 }
 ```
-
-The open endpoint updates `EmailTracking.xlsx` and returns the existing
-transparent 1x1 PNG. The Phase 2 tracking implementation is unchanged.
-
-## Operational notes
-
-- The persistent disk permits only one service instance and prevents
-  zero-downtime deploys, which protects the single Excel workbook from
-  concurrent instances.
-- Daily application logs are written under `logs/` and emitted to standard
-  output for viewing in the Render Dashboard. The local log files are ephemeral;
-  Render's log stream should be used for production diagnostics.
-- The `.gitignore` excludes generated workbooks, logs, virtual environments,
-  caches, and local environment files.
-"# EmailTrackingServer" 
-"# EmailTrackingServer" 

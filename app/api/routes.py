@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from starlette.concurrency import run_in_threadpool
 
 from app.models.statistics import SampleStatistics
+from app.services.database_tracking import DatabaseTrackingService
 from app.services.excel_tracking import ExcelTrackingService
 from app.services.tracking_debug import TrackingDebugService
 from app.services.tracking_pixel import get_transparent_pixel
@@ -19,7 +20,9 @@ from config.settings import PROJECT_ROOT, load_settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-tracking_service = ExcelTrackingService(load_settings().tracking_file)
+settings = load_settings()
+tracking_service = ExcelTrackingService(settings.tracking_file)
+database_service = DatabaseTrackingService(settings.database_url)
 debug_service = TrackingDebugService(tracking_service.workbook_path)
 DEBUG_TAG = "Development / Debug Only"
 
@@ -73,6 +76,28 @@ async def track_email_open(tracking_id: TrackingId, request: Request) -> Respons
             result.open_count,
             result.status,
         )
+        try:
+            await run_in_threadpool(
+                database_service.record_open,
+                tracking_id,
+                result.open_count,
+                client_ip,
+                user_agent,
+                occurred_at,
+            )
+            logger.info(
+                "PostgreSQL tracking update completed: TrackingId=%s OpenCount=%d",
+                tracking_id,
+                result.open_count,
+            )
+        except Exception as database_exc:
+            # Excel remains authoritative when Neon is unavailable.
+            logger.error(
+                "PostgreSQL tracking update failed: TrackingId=%s Error=%s",
+                tracking_id,
+                database_exc,
+                exc_info=True,
+            )
     except Exception as exc:
         # Storage failures must never prevent an email client loading the pixel.
         logger.error(
@@ -197,3 +222,33 @@ async def get_debug_information() -> dict[str, object]:
         total_records,
     )
     return response
+
+
+@router.get(
+    "/api/database/status",
+    tags=[DEBUG_TAG],
+    summary="Development only: inspect PostgreSQL status",
+    description=(
+        "Development / Debug Only. Reports Neon connectivity, table presence, "
+        "and the current email_tracking row count."
+    ),
+)
+async def get_database_status() -> dict[str, object]:
+    """Return read-only PostgreSQL connection and table diagnostics."""
+    logger.info("Debug endpoint requested: GET /api/database/status")
+    database_status = await run_in_threadpool(database_service.get_status)
+    if database_status.error:
+        logger.error("Database status check failed: %s", database_status.error)
+    else:
+        logger.info(
+            "Database status completed: connected=%s table_exists=%s "
+            "total_records=%d",
+            database_status.connected,
+            database_status.table_exists,
+            database_status.total_records,
+        )
+    return {
+        "database_connected": database_status.connected,
+        "table_exists": database_status.table_exists,
+        "total_records": database_status.total_records,
+    }
