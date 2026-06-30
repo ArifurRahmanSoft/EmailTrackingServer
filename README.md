@@ -105,6 +105,32 @@ The complete flow is:
 Missing or invalid input returns HTTP 400. A redirect is never issued unless
 the database transaction succeeds.
 
+## Desktop tracking synchronization
+
+The desktop Email Automation application can retrieve tracking state with:
+
+```text
+GET /api/tracking/sync
+GET /api/tracking/sync?updated_after=2026-07-01T09:30:00Z
+```
+
+Without `updated_after`, the endpoint returns every PostgreSQL tracking record.
+With a valid ISO-8601 cursor, it returns only rows where `updated_at` is strictly
+later than the cursor. Results are always sorted by `updated_at` ascending.
+
+Each response object contains only:
+
+- `tracking_id`
+- `open_count` and `click_count`
+- `first_open` and `last_open`
+- `first_click` and `last_click`
+- `updated_at`
+
+This allows the desktop application to match rows in `mail_list.xlsx` by
+`TrackingId`. After a successful synchronization, the application should store
+the newest returned `updated_at` value and pass it as the next request's
+`updated_after` cursor. Invalid timestamps return HTTP 400.
+
 ## Development endpoints
 
 Temporary debug routes appear in Swagger under **Development / Debug Only**:
@@ -152,6 +178,7 @@ https://<service-name>.onrender.com/health
 https://<service-name>.onrender.com/email/open/test123
 https://<service-name>.onrender.com/email/click/test123?url=https%3A%2F%2Fpowersoft.com
 https://<service-name>.onrender.com/api/database/status
+https://<service-name>.onrender.com/api/tracking/sync
 https://<service-name>.onrender.com/docs
 ```
 
@@ -172,5 +199,5 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The tests use an in-memory fake database service and never connect to Neon or
-modify the Excel workbook.
+The endpoint tests use in-memory fake database services and never connect to
+Neon or modify the Excel workbook.

@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import re
+import time
 from datetime import datetime, timezone
 
 from typing import Annotated
@@ -13,11 +14,13 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from starlette.concurrency import run_in_threadpool
 
 from app.models.statistics import SampleStatistics
+from app.models.tracking_sync import TrackingSyncRecord
 from app.services.database_tracking import DatabaseTrackingService
 from app.services.excel_tracking import ExcelTrackingService
 from app.services.tracking_debug import TrackingDebugService
 from app.services.tracking_pixel import get_transparent_pixel
 from app.utils.url_validation import is_valid_http_url
+from app.utils.datetime_parsing import parse_iso8601_utc
 from config.settings import PROJECT_ROOT, load_settings
 
 router = APIRouter()
@@ -355,3 +358,79 @@ async def get_database_status() -> dict[str, object]:
         "table_exists": database_status.table_exists,
         "total_records": database_status.total_records,
     }
+
+
+@router.get(
+    "/api/tracking/sync",
+    tags=["Synchronization"],
+    summary="Synchronize tracking updates with the desktop application",
+    response_model=list[TrackingSyncRecord],
+    responses={400: {"description": "Invalid updated_after timestamp"}},
+)
+async def synchronize_tracking_records(
+    request: Request,
+    updated_after: str | None = Query(
+        default=None,
+        description=(
+            "Optional ISO-8601 cursor. Only records updated after this time "
+            "are returned."
+        ),
+    ),
+) -> list[TrackingSyncRecord]:
+    """Return all or incrementally updated tracking records in ascending order."""
+    started_at = time.perf_counter()
+    request_time = datetime.now(timezone.utc)
+    client_ip = request.client.host if request.client else "unknown"
+
+    parsed_updated_after = None
+    if updated_after is not None:
+        try:
+            parsed_updated_after = parse_iso8601_utc(updated_after)
+        except ValueError as exc:
+            execution_ms = (time.perf_counter() - started_at) * 1000
+            logger.warning(
+                "Sync Request Time=%s ClientIP=%s updated_after=%s "
+                "Returned Record Count=0 Execution Time=%.2fms Status=invalid",
+                request_time.isoformat(),
+                client_ip,
+                updated_after,
+                execution_ms,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="updated_after must be a valid ISO-8601 datetime.",
+            ) from exc
+
+    try:
+        records = await run_in_threadpool(
+            database_service.fetch_sync_records,
+            parsed_updated_after,
+        )
+    except Exception as exc:
+        execution_ms = (time.perf_counter() - started_at) * 1000
+        logger.error(
+            "Sync Request Time=%s ClientIP=%s updated_after=%s "
+            "Returned Record Count=0 Execution Time=%.2fms Status=failed Error=%s",
+            request_time.isoformat(),
+            client_ip,
+            updated_after,
+            execution_ms,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tracking synchronization is temporarily unavailable.",
+        ) from exc
+
+    execution_ms = (time.perf_counter() - started_at) * 1000
+    logger.info(
+        "Sync Request Time=%s ClientIP=%s updated_after=%s "
+        "Returned Record Count=%d Execution Time=%.2fms Status=success",
+        request_time.isoformat(),
+        client_ip,
+        updated_after,
+        len(records),
+        execution_ms,
+    )
+    return [TrackingSyncRecord.model_validate(record) for record in records]

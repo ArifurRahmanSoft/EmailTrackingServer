@@ -192,6 +192,39 @@ class DatabaseTrackingService:
                 error=str(exc),
             )
 
+    def fetch_sync_records(
+        self,
+        updated_after: datetime | None = None,
+    ) -> list[dict[str, object]]:
+        """Return only desktop synchronization fields ordered by update time."""
+        session_factory = self._require_session_factory()
+        statement = select(
+            EmailTracking.tracking_id,
+            EmailTracking.open_count,
+            EmailTracking.click_count,
+            EmailTracking.first_open,
+            EmailTracking.last_open,
+            EmailTracking.first_click,
+            EmailTracking.last_click,
+            EmailTracking.updated_at,
+        )
+        if updated_after is not None:
+            statement = statement.where(
+                EmailTracking.updated_at > self._as_utc(updated_after)
+            )
+        statement = statement.order_by(EmailTracking.updated_at.asc())
+
+        try:
+            with session_factory() as session:
+                rows = session.execute(
+                    statement.execution_options(stream_results=True, yield_per=1000)
+                ).mappings()
+                return [dict(row) for row in rows]
+        except Exception as exc:
+            raise DatabaseUnavailableError(
+                f"Unable to fetch PostgreSQL synchronization records: {exc}"
+            ) from exc
+
     def dispose(self) -> None:
         """Release pooled database connections during application shutdown."""
         if self._engine is not None:
