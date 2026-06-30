@@ -24,6 +24,15 @@ class DatabaseStatus:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ClickUpdateResult:
+    """Result of a successful click update."""
+
+    click_count: int
+    first_click: datetime
+    last_click: datetime
+
+
 class DatabaseTrackingService:
     """Create the schema and mirror successful Excel tracking writes."""
 
@@ -101,6 +110,50 @@ class DatabaseTrackingService:
         except Exception as exc:
             raise DatabaseUnavailableError(
                 f"Unable to update PostgreSQL tracking record: {exc}"
+            ) from exc
+
+    def record_click(
+        self,
+        tracking_id: str,
+        client_ip: str,
+        user_agent: str,
+        occurred_at: datetime,
+    ) -> ClickUpdateResult | None:
+        """Update an existing tracking row for one recipient click.
+
+        The row is locked until commit so concurrent clicks cannot lose count
+        increments or overwrite the original ``first_click`` timestamp.
+        """
+        session_factory = self._require_session_factory()
+        timestamp = self._as_utc(occurred_at)
+
+        try:
+            with session_factory() as session:
+                record = session.scalar(
+                    select(EmailTracking)
+                    .where(EmailTracking.tracking_id == tracking_id)
+                    .with_for_update()
+                )
+                if record is None:
+                    return None
+
+                record.click_count = (record.click_count or 0) + 1
+                if record.first_click is None:
+                    record.first_click = timestamp
+                record.last_click = timestamp
+                record.last_ip = client_ip
+                record.user_agent = user_agent
+                record.updated_at = timestamp
+                session.commit()
+
+                return ClickUpdateResult(
+                    click_count=record.click_count,
+                    first_click=record.first_click,
+                    last_click=record.last_click,
+                )
+        except Exception as exc:
+            raise DatabaseUnavailableError(
+                f"Unable to update PostgreSQL click record: {exc}"
             ) from exc
 
     def get_status(self) -> DatabaseStatus:

@@ -6,7 +6,7 @@ Excel support remains active and tracking continues when PostgreSQL is
 temporarily unavailable.
 
 The project does not send email or implement a dashboard, authentication,
-reports, scheduler, desktop integration, or click-tracking logic.
+reports, scheduler, or desktop integration.
 
 ## Requirements
 
@@ -76,6 +76,35 @@ The application creates the configured data folder and `EmailTracking.xlsx`
 automatically. Daily logs are written to `logs/YYYY-MM-DD.log`. The existing
 Excel schema and tracking behavior remain unchanged.
 
+## Click tracking
+
+Tracked links use this endpoint:
+
+```text
+GET /email/click/{tracking_id}?url={encoded_original_url}
+```
+
+Example:
+
+```text
+/email/click/7d19af31-2d65-49db-b52e-2c92b5d39b61?url=https%3A%2F%2Fpowersoft.com
+```
+
+The complete flow is:
+
+1. Validate that `tracking_id` contains only URL-safe letters, numbers,
+   underscores, or hyphens.
+2. Validate that `url` is a complete HTTP or HTTPS URL.
+3. Find and lock the existing PostgreSQL row for the tracking ID.
+4. Return HTTP 404 without redirecting when the row does not exist.
+5. Increment `click_count`, set `first_click` only when it is currently null,
+   and update `last_click`, `last_ip`, `user_agent`, and `updated_at` in UTC.
+6. Commit the transaction.
+7. Return an immediate HTTP 302 redirect to the exact original URL.
+
+Missing or invalid input returns HTTP 400. A redirect is never issued unless
+the database transaction succeeds.
+
 ## Development endpoints
 
 Temporary debug routes appear in Swagger under **Development / Debug Only**:
@@ -121,6 +150,7 @@ does not define or overwrite it.
 ```text
 https://<service-name>.onrender.com/health
 https://<service-name>.onrender.com/email/open/test123
+https://<service-name>.onrender.com/email/click/test123?url=https%3A%2F%2Fpowersoft.com
 https://<service-name>.onrender.com/api/database/status
 https://<service-name>.onrender.com/docs
 ```
@@ -132,3 +162,15 @@ The `/health` response remains:
   "status": "ok"
 }
 ```
+
+## Tests
+
+Install development dependencies and run the click-tracking test suite:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The tests use an in-memory fake database service and never connect to Neon or
+modify the Excel workbook.

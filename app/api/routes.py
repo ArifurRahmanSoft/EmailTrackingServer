@@ -3,11 +3,12 @@
 import logging
 import os
 import platform
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 
 from typing import Annotated
 
-from fastapi import APIRouter, Path, Request, status
+from fastapi import APIRouter, HTTPException, Path, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
@@ -16,6 +17,7 @@ from app.services.database_tracking import DatabaseTrackingService
 from app.services.excel_tracking import ExcelTrackingService
 from app.services.tracking_debug import TrackingDebugService
 from app.services.tracking_pixel import get_transparent_pixel
+from app.utils.url_validation import is_valid_http_url
 from config.settings import PROJECT_ROOT, load_settings
 
 router = APIRouter()
@@ -25,6 +27,7 @@ tracking_service = ExcelTrackingService(settings.tracking_file)
 database_service = DatabaseTrackingService(settings.database_url)
 debug_service = TrackingDebugService(tracking_service.workbook_path)
 DEBUG_TAG = "Development / Debug Only"
+CLICK_TRACKING_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 # Tracking IDs remain URL-safe and must contain at least one character.
 TrackingId = Annotated[
@@ -120,13 +123,113 @@ async def track_email_open(tracking_id: TrackingId, request: Request) -> Respons
 @router.get(
     "/email/click/{tracking_id}",
     tags=["Tracking"],
-    summary="Handle a tracked-link click",
-    status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+    summary="Track a recipient click and redirect",
+    status_code=status.HTTP_302_FOUND,
+    responses={
+        302: {"description": "Click recorded; redirect to the original URL"},
+        400: {"description": "Invalid tracking ID or destination URL"},
+        404: {"description": "Tracking ID not found"},
+    },
 )
-async def track_email_click(tracking_id: TrackingId) -> RedirectResponse:
-    """Return a placeholder redirect until click destinations are implemented."""
-    _ = tracking_id
-    return RedirectResponse(url="/health", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+async def track_email_click(
+    tracking_id: str,
+    request: Request,
+    url: str | None = Query(
+        default=None,
+        description="URL-encoded original HTTP or HTTPS destination.",
+    ),
+) -> RedirectResponse:
+    """Record a database click and redirect to the validated original URL."""
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    click_time = datetime.now(timezone.utc)
+
+    if not CLICK_TRACKING_ID_PATTERN.fullmatch(tracking_id):
+        logger.warning(
+            "Click rejected: TrackingId=%s OriginalURL=%s ClickTime=%s "
+            "ClientIP=%s UserAgent=%s DatabaseUpdateStatus=not_attempted "
+            "RedirectStatus=not_redirected Reason=invalid_tracking_id",
+            tracking_id,
+            url,
+            click_time.isoformat(),
+            client_ip,
+            user_agent,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid tracking_id.",
+        )
+
+    if url is None or not is_valid_http_url(url):
+        logger.warning(
+            "Click rejected: TrackingId=%s OriginalURL=%s ClickTime=%s "
+            "ClientIP=%s UserAgent=%s DatabaseUpdateStatus=not_attempted "
+            "RedirectStatus=not_redirected Reason=invalid_url",
+            tracking_id,
+            url,
+            click_time.isoformat(),
+            client_ip,
+            user_agent,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A valid HTTP or HTTPS url query parameter is required.",
+        )
+
+    try:
+        result = await run_in_threadpool(
+            database_service.record_click,
+            tracking_id,
+            client_ip,
+            user_agent,
+            click_time,
+        )
+    except Exception as exc:
+        logger.error(
+            "Click failed: TrackingId=%s OriginalURL=%s ClickTime=%s "
+            "ClientIP=%s UserAgent=%s DatabaseUpdateStatus=failed "
+            "RedirectStatus=not_redirected Error=%s",
+            tracking_id,
+            url,
+            click_time.isoformat(),
+            client_ip,
+            user_agent,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Click tracking is temporarily unavailable.",
+        ) from exc
+
+    if result is None:
+        logger.warning(
+            "Click rejected: TrackingId=%s OriginalURL=%s ClickTime=%s "
+            "ClientIP=%s UserAgent=%s DatabaseUpdateStatus=not_found "
+            "RedirectStatus=not_redirected",
+            tracking_id,
+            url,
+            click_time.isoformat(),
+            client_ip,
+            user_agent,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tracking ID not found.",
+        )
+
+    logger.info(
+        "Click tracked: TrackingId=%s OriginalURL=%s ClickTime=%s "
+        "ClientIP=%s UserAgent=%s ClickCount=%d DatabaseUpdateStatus=updated "
+        "RedirectStatus=302",
+        tracking_id,
+        url,
+        click_time.isoformat(),
+        client_ip,
+        user_agent,
+        result.click_count,
+    )
+    return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
 
 
 @router.get(
